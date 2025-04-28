@@ -1,4 +1,6 @@
 const http = require('http');
+const express = require('express'); // Import Express
+
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { createClient } = require('@supabase/supabase-js');
@@ -18,8 +20,34 @@ if (!token || !supabaseUrl || !supabaseKey) {
 }
 
 // --- Initialize Clients ---
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(token);
+const app = express();
+const PORT = process.env.PORT || 8080;
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+app.use(express.json());
+const WEBHOOK_PATH = `/webhook/${token}`; // Using token in path adds a layer of security
+
+app.post(WEBHOOK_PATH, (req, res) => {
+    console.log("Received Telegram update via webhook:", JSON.stringify(req.body));
+    bot.processUpdate(req.body); // Hand off the update to node-telegram-bot-api
+    res.sendStatus(200); // Send OK status back to Telegram immediately
+});
+
+// Optional: A root path for health checks or basic info
+app.get('/', (req, res) => {
+    res.status(200).send('Telegram Bot is running (Webhook Mode)');
+});
+
+// --- Start the Express Server ---
+app.listen(PORT, () => {
+    console.log(`HTTP Server started on port ${PORT}`);
+    console.log(`Webhook endpoint ready at ${WEBHOOK_PATH}`);
+    // You only need to set the webhook ONCE, usually manually or via a setup script
+    // Do NOT set it here on every startup if running on Cloud Run, as the URL might change
+    // setWebhook(); // See function below - use this carefully
+});
+
 
 // --- Authentication Helper ---
 async function isUserAllowed(chatId) {
@@ -898,11 +926,16 @@ cron.schedule('*/5 * * * *', async () => {
     }
     console.log(`[Cron] Finished periodic check. Duration: ${(new Date() - scheduleTime)/1000}s`);
 });
-const PORT = process.env.PORT || 8080;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is running\n');
-}).listen(PORT);
+const setWebhook = async () => {
+    const webhookUrl = `YOUR_CLOUDRUN_SERVICE_URL${WEBHOOK_PATH}`; // Get this from gcloud or Console
+    console.log(`Setting webhook to: ${webhookUrl}`);
+    try {
+        await bot.setWebHook(webhookUrl);
+        console.log('Webhook set successfully!');
+    } catch (error) {
+        console.error('Error setting webhook:', error.response ? error.response.body : error.message);
+    }
+};
 
 console.log(`HTTP Server started on port ${PORT}`);
 console.log('Telegram bot started...');
