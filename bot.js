@@ -1,3 +1,4 @@
+const http = require('http');
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { createClient } = require('@supabase/supabase-js');
@@ -897,7 +898,13 @@ cron.schedule('*/5 * * * *', async () => {
     }
     console.log(`[Cron] Finished periodic check. Duration: ${(new Date() - scheduleTime)/1000}s`);
 });
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is running\n');
+}).listen(PORT);
 
+console.log(`HTTP Server started on port ${PORT}`);
 console.log('Telegram bot started...');
 
 // TODO: Add functions for station disambiguation (showing inline keyboard)
