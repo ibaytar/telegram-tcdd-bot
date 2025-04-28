@@ -55,7 +55,7 @@ RUN apt-get update && \
 
 # Copy dependency definition files FROM THE PROJECT ROOT
 # Assumes build context is the parent directory of bot_deploy
-COPY ../package.json ../pnpm-lock.yaml ./
+COPY ./package.json ./pnpm-lock.yaml ./
 
 # Install project dependencies
 # Using --frozen-lockfile is recommended for CI/deployments
