@@ -1,5 +1,8 @@
 // check_tcdd.js
 
+// Force timezone for the Node.js process
+process.env.TZ = 'Europe/Istanbul';
+
 const { chromium } = require('playwright');
 const { Command } = require('commander');
 const program = new Command();
@@ -55,7 +58,11 @@ async function run(departureSelect, arrivalSelect, targetDateStr) {
 
   // For debugging: headless: false. For actual runs: headless: true
   const browser = await chromium.launch({ headless: true }); // slowMo optional for watching
-  const context = await browser.newContext();
+  // Configure context with locale and timezone
+  const context = await browser.newContext({
+    locale: 'tr-TR',
+    timezoneId: 'Europe/Istanbul'
+  });
   const page = await context.newPage();
 
   try { // Wrap the whole process in try/finally for robust browser closing
