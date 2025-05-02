@@ -1,7 +1,7 @@
 # bot_deploy/Dockerfile
 
-# Use an official Node.js runtime as a parent image (choose a version)
-FROM node:18-slim
+# Use an official Node.js runtime as a parent image
+FROM node:20-slim
 
 # Install pnpm
 RUN npm install -g pnpm
@@ -9,22 +9,23 @@ RUN npm install -g pnpm
 # Set the working directory in the container
 WORKDIR /app
 
-# --- Install OS Dependencies for Playwright ---
-# Based on official Playwright Docker guide
+# --- Install OS Dependencies for Playwright with Firefox ---
+# Based on official Playwright Docker guide for Firefox
 # https://playwright.dev/docs/docker
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    # Browsers dependencies
+    # Firefox dependencies - minimal set
+    ca-certificates \
+    fonts-liberation \
+    libdbus-glib-1-2 \
+    libgtk-3-0 \
+    libxt6 \
     libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libatspi2.0-0 \
     libcairo2 \
     libcups2 \
     libdbus-1-3 \
-    libdrm2 \
     libexpat1 \
-    libgbm1 \
+    libfontconfig1 \
     libgcc1 \
     libglib2.0-0 \
     libnspr4 \
@@ -46,11 +47,10 @@ RUN apt-get update && \
     libxss1 \
     libxtst6 \
     # Other dependencies
-    lsb-release \
-    wget \
     xvfb \
     # Clean up
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 # --- End OS Dependencies ---
 
 # Copy dependency definition files FROM THE PROJECT ROOT
@@ -58,8 +58,8 @@ RUN apt-get update && \
 COPY ./package.json ./pnpm-lock.yaml ./
 
 # Install project dependencies
-# Using --frozen-lockfile is recommended for CI/deployments
-RUN pnpm install --frozen-lockfile
+# Using --no-frozen-lockfile to handle package.json changes
+RUN pnpm install --no-frozen-lockfile
 
 # Copy files FROM bot_deploy folder INTO the container's /app directory
 COPY bot.js ./
@@ -68,12 +68,14 @@ COPY stations.json ./
 
 # Install Playwright with Firefox (lightweight configuration)
 # Use pnpm exec to ensure the correct playwright instance is used
-RUN pnpm exec playwright install --with-deps firefox
+RUN pnpm exec playwright install firefox && \
+    pnpm exec playwright install-deps firefox
 
 # Set environment variables for memory optimization
 ENV NODE_OPTIONS="--max-old-space-size=512"
 ENV PLAYWRIGHT_BROWSERS_PATH=0
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
+ENV PLAYWRIGHT_BROWSER_NAME=firefox
 
 # Set the command to run the bot with memory optimization flags
 CMD ["node", "--expose-gc", "--optimize-for-size", "--max-old-space-size=512", "bot.js"]
