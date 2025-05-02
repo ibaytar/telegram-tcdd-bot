@@ -47,8 +47,8 @@ temp/
 *.jpg
 *.jpeg
 
-# Fly.io specific
-fly.toml
+# Deployment files
+deploy-to-hetzner.sh
 
 # Documentation
 README.md

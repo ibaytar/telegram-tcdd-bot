@@ -31,7 +31,7 @@ echo -e "${GREEN}Created temporary directory: $TEMP_DIR${NC}"
 
 # Copy necessary files to the temporary directory
 echo -e "${GREEN}Copying project files...${NC}"
-cp -r Dockerfile docker-compose.yml package.json pnpm-lock.yaml bot.js check_tcdd.js stations.json "$TEMP_DIR"
+cp -r Dockerfile docker-compose.yml package.json pnpm-lock.yaml bot.js check_tcdd.js stations.json setup-webhook.js "$TEMP_DIR"
 
 # Create a logs directory
 mkdir -p "$TEMP_DIR/logs"
@@ -66,6 +66,9 @@ WEBHOOK_URL=https://your_server_domain_or_ip
 # Supabase Configuration
 SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_key
+
+# Optional: Auto-setup webhook on startup (true/false)
+AUTO_SETUP_WEBHOOK=false
 ENVEOF
     echo "Please edit the .env file with your actual values."
 fi
@@ -101,94 +104,6 @@ EOF
 
 # Make the setup script executable
 chmod +x "$TEMP_DIR/setup.sh"
-
-# Create a script to set up the webhook
-cat > "$TEMP_DIR/setup-webhook.js" << 'EOF'
-// setup-webhook.js
-// Script to set up the Telegram webhook for your bot
-
-require('dotenv').config();
-const https = require('https');
-
-// Get the bot token from environment variables
-const token = process.env.TELEGRAM_BOT_TOKEN;
-if (!token) {
-  console.error('Error: TELEGRAM_BOT_TOKEN environment variable is not set.');
-  process.exit(1);
-}
-
-// Get the webhook URL from environment variables
-const webhookUrl = process.env.WEBHOOK_URL;
-if (!webhookUrl) {
-  console.error('Error: WEBHOOK_URL environment variable is not set.');
-  process.exit(1);
-}
-
-// Construct the full webhook URL
-const fullWebhookUrl = `${webhookUrl}/webhook/${token}`;
-
-// Construct the Telegram API URL
-const telegramApiUrl = `https://api.telegram.org/bot${token}/setWebhook?url=${encodeURIComponent(fullWebhookUrl)}`;
-
-// Make the request to set the webhook
-console.log(`Setting webhook to: ${fullWebhookUrl}`);
-https.get(telegramApiUrl, (res) => {
-  let data = '';
-  
-  res.on('data', (chunk) => {
-    data += chunk;
-  });
-  
-  res.on('end', () => {
-    try {
-      const response = JSON.parse(data);
-      if (response.ok) {
-        console.log('Webhook set successfully!');
-        console.log('Response:', response);
-        
-        // Now get webhook info to verify
-        getWebhookInfo();
-      } else {
-        console.error('Failed to set webhook:', response.description);
-      }
-    } catch (error) {
-      console.error('Error parsing response:', error.message);
-    }
-  });
-}).on('error', (error) => {
-  console.error('Error setting webhook:', error.message);
-});
-
-// Function to get webhook info
-function getWebhookInfo() {
-  const infoUrl = `https://api.telegram.org/bot${token}/getWebhookInfo`;
-  
-  console.log('\nGetting webhook info...');
-  https.get(infoUrl, (res) => {
-    let data = '';
-    
-    res.on('data', (chunk) => {
-      data += chunk;
-    });
-    
-    res.on('end', () => {
-      try {
-        const response = JSON.parse(data);
-        if (response.ok) {
-          console.log('Current webhook info:');
-          console.log(JSON.stringify(response.result, null, 2));
-        } else {
-          console.error('Failed to get webhook info:', response.description);
-        }
-      } catch (error) {
-        console.error('Error parsing response:', error.message);
-      }
-    });
-  }).on('error', (error) => {
-    console.error('Error getting webhook info:', error.message);
-  });
-}
-EOF
 
 # Transfer files to the VPS
 echo -e "${GREEN}Transferring files to the VPS...${NC}"

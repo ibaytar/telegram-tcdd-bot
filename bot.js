@@ -1,6 +1,4 @@
-const http = require('http');
 const express = require('express'); // Import Express
-const { OAuth2Client } = require('google-auth-library');
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
@@ -8,11 +6,12 @@ const { createClient } = require('@supabase/supabase-js');
 const { exec } = require('child_process'); // To run the check_tcdd.js script
 const path = require('path'); // Needed for script path
 const util = require('util'); // For promisify
+const nodeCron = require('node-cron'); // For scheduling periodic checks
 
 // --- Credentials ---
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabaseKey = process.env.SUPABASE_KEY;
 
 if (!token || !supabaseUrl || !supabaseKey) {
     console.error("Hata: Lütfen .env dosyasını kontrol edin ve gerekli Telegram ve Supabase bilgilerini ekleyin.");
@@ -24,53 +23,9 @@ const bot = new TelegramBot(token);
 const app = express();
 const PORT = process.env.PORT || 8080;
 const supabase = createClient(supabaseUrl, supabaseKey);
-const authClient = new OAuth2Client();
 
 app.use(express.json());
 const WEBHOOK_PATH = `/webhook/${token}`; // Using token in path adds a layer of security
-
-// --- Cloud Scheduler Verification Middleware ---
-// Function to verify OIDC token from Cloud Scheduler
-async function verifyCloudSchedulerToken(req, res, next) {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader) {
-        console.warn('[Auth] Scheduler request missing Authorization header.');
-        return res.status(401).send('Unauthorized: Missing Authorization header');
-    }
-
-    const [bearer, token] = authHeader.split(' ');
-
-    if (bearer !== 'Bearer' || !token) {
-        console.warn('[Auth] Scheduler request had malformed Authorization header.');
-        return res.status(401).send('Unauthorized: Malformed Authorization header');
-    }
-
-    try {
-        // Replace with your Cloud Run service URL or leave undefined for broader validation
-        const expectedAudience = process.env.CLOUD_RUN_SERVICE_URL; // Set this in your .env or Cloud Run env vars
-
-        if (!expectedAudience) {
-             console.warn('[Auth] CLOUD_RUN_SERVICE_URL environment variable not set. Cannot verify audience.');
-             // Decide if you want to proceed without audience check (less secure) or fail
-             // return res.status(500).send('Configuration error: Audience not set');
-        }
-
-
-        // Verify the token
-        const ticket = await authClient.verifyIdToken({
-            idToken: token,
-            audience: expectedAudience, // Verify it's intended for your service
-        });
-
-        // Optional: You could check ticket.getPayload() for issuer etc., but audience check is key
-        console.log('[Auth] Successfully verified Cloud Scheduler token.');
-        next(); // Proceed to the actual handler
-    } catch (error) {
-        console.error('[Auth] Cloud Scheduler token verification failed:', error.message);
-        return res.status(401).send(`Unauthorized: ${error.message}`);
-    }
-}
 
 // --- Telegram Webhook Endpoint ---
 app.post(WEBHOOK_PATH, (req, res) => {
@@ -79,16 +34,12 @@ app.post(WEBHOOK_PATH, (req, res) => {
     res.sendStatus(200); // Send OK status back to Telegram immediately
 });
 
-// --- Periodic Check Endpoint (Triggered by Cloud Scheduler) ---
-// Apply the verification middleware ONLY to this route
-app.post('/run-periodic-check', verifyCloudSchedulerToken, async (req, res) => {
-    console.log('[Scheduler] Received request to run periodic check...');
+// --- Periodic Check Function (Run by node-cron) ---
+async function runPeriodicCheck() {
+    console.log('[Cron] Running periodic check for available seats...');
     const scheduleTime = new Date(); // Log start time
 
     try {
-        // --- Start of moved cron logic ---
-        console.log('[Cron Logic] Running periodic check for available seats...');
-
         // 1. Fetch active monitoring requests
         const { data: requests, error: fetchError } = await supabase
             .from('user_requests')
@@ -96,18 +47,16 @@ app.post('/run-periodic-check', verifyCloudSchedulerToken, async (req, res) => {
             .eq('status', 'monitoring');
 
         if (fetchError) {
-            console.error('[Cron Logic] Error fetching monitoring requests:', fetchError);
-            // Send error response to Scheduler so it knows the job failed
-            return res.status(500).send('Error fetching monitoring requests');
+            console.error('[Cron] Error fetching monitoring requests:', fetchError);
+            return;
         }
 
         if (!requests || requests.length === 0) {
-            console.log('[Cron Logic] No active monitoring requests to check.');
-            // Send success response as there's nothing to do
-            return res.status(200).send('No active monitoring requests');
+            console.log('[Cron] No active monitoring requests to check.');
+            return;
         }
 
-        console.log(`[Cron Logic] Checking ${requests.length} monitoring requests...`);
+        console.log(`[Cron] Checking ${requests.length} monitoring requests...`);
 
         let checksAttempted = 0;
         let successfulNotifications = 0;
@@ -118,34 +67,33 @@ app.post('/run-periodic-check', verifyCloudSchedulerToken, async (req, res) => {
              checksAttempted++;
              // Basic check for essential data
              if (!req.mapped_departure || !req.mapped_arrival || !req.selected_date || !req.seat_type || !req.selected_times || req.selected_times.length === 0) {
-                 console.warn(`[Cron Logic] Skipping request for chat ${req.chat_id} due to missing data:`, req);
+                 console.warn(`[Cron] Skipping request for chat ${req.chat_id} due to missing data:`, req);
                  // Consider setting status to 'error' or 'cancelled' here after multiple failures
                  continue;
              }
 
              try {
-                 console.log(`[Cron Logic] Checking request for chat ${req.chat_id} (Date: ${req.selected_date}, Times: ${req.selected_times?.join(',')}, Type: ${req.seat_type})`);
+                 console.log(`[Cron] Checking request for chat ${req.chat_id} (Date: ${req.selected_date}, Times: ${req.selected_times?.join(',')}, Type: ${req.seat_type})`);
 
                  // 3. Construct and execute check_tcdd.js command
                  const scriptPath = path.join(__dirname, 'check_tcdd.js');
                  const command = `node --expose-gc --optimize-for-size --max-old-space-size=512 "${scriptPath}" --nereden="${req.mapped_departure}" --nereye="${req.mapped_arrival}" --tarih="${req.selected_date}"`;
 
                  const execPromise = util.promisify(exec);
-                 // Increased timeout for Firefox in cloud environment
                  const { stdout, stderr } = await execPromise(command, {
                      timeout: 120000, // 2 minutes
                      maxBuffer: 1024 * 1024 // 1MB buffer for output
                  });
 
                  if (stderr && !stderr.includes('INFO:CONSOLE')) {
-                      console.warn(`[Cron Logic Stderr] for chat ${req.chat_id}: ${stderr}`);
+                      console.warn(`[Cron Stderr] for chat ${req.chat_id}: ${stderr}`);
                  }
 
                  // 4. Parse output
                  const lines = stdout.split(/\r?\n/);
                  const jsonLine = lines.find(line => line.startsWith('SEAT_DATA_JSON:'));
                  if (!jsonLine) {
-                      console.error(`[Cron Logic Check Error] No SEAT_DATA_JSON found in output for chat ${req.chat_id}. Script output:
+                      console.error(`[Cron Check Error] No SEAT_DATA_JSON found in output for chat ${req.chat_id}. Script output:
 ${stdout}`);
                       errorsEncountered++;
                       continue; // Skip to next request
@@ -164,7 +112,7 @@ ${stdout}`);
                               if (timeResult.details[req.seat_type] > 0) {
                                  foundMatch = true;
                                  const countFound = timeResult.details[req.seat_type];
-                                 console.log(`[Cron Logic] === FOUND SEAT! === Chat: ${req.chat_id}, Time: ${timeResult.time}, Type: ${req.seat_type}, Count: ${countFound}`);
+                                 console.log(`[Cron] === FOUND SEAT! === Chat: ${req.chat_id}, Time: ${timeResult.time}, Type: ${req.seat_type}, Count: ${countFound}`);
 
                                  // 6. Notify user
                                  const message = `🎉 Koltuk Bulundu! 🎉\n\nİstek Detayları:\nKalkış: ${req.mapped_departure}\nVarış: ${req.mapped_arrival}\nTarih: ${req.selected_date}\n\nSefer Saati: *${timeResult.time}*\nKoltuk Tipi: *${req.seat_type}*\nBoş Koltuk Sayısı: *${countFound}*\n\nHemen bilet almak için: https://ebilet.tcddtasimacilik.gov.tr/`;
@@ -173,7 +121,7 @@ ${stdout}`);
 
                                  // 7. Update request status to completed
                                  await updateUserState(req.chat_id, { status: 'completed', last_check_results: null, selected_times: null });
-                                 console.log(`[Cron Logic] Request for chat ${req.chat_id} marked as completed.`);
+                                 console.log(`[Cron] Request for chat ${req.chat_id} marked as completed.`);
 
                                  break; // Stop checking other times for this request once found
                               }
@@ -182,28 +130,31 @@ ${stdout}`);
                  } // end loop through time results
 
                  if (!foundMatch) {
-                     console.log(`[Cron Logic] No matching seat found for chat ${req.chat_id} in this check.`);
+                     console.log(`[Cron] No matching seat found for chat ${req.chat_id} in this check.`);
                      // Optional: Update a 'last_checked_at' timestamp in Supabase
                  }
 
              } catch (execError) {
-                  console.error(`[Cron Logic] Error executing check_tcdd.js for chat ${req.chat_id}:`, execError);
+                  console.error(`[Cron] Error executing check_tcdd.js for chat ${req.chat_id}:`, execError);
                   errorsEncountered++;
                   // Consider notifying the user or setting status to 'error'
                   // Optionally: await bot.sendMessage(req.chat_id, `⚠️ Periyodik kontrol sırasında bir hata oluştu (${req.selected_date} ${req.mapped_departure} -> ${req.mapped_arrival}). Lütfen tekrar deneyin veya yönetici ile iletişime geçin.`);
              }
         } // End loop through requests
-        // --- End of moved cron logic ---
 
-        console.log(`[Scheduler] Periodic check finished. Attempted: ${checksAttempted}, Notifications: ${successfulNotifications}, Errors: ${errorsEncountered}. Time taken: ${(new Date() - scheduleTime) / 1000}s`);
-        // Send success response to Cloud Scheduler
-        res.status(200).send(`Check completed. Attempted: ${checksAttempted}, Notifications: ${successfulNotifications}, Errors: ${errorsEncountered}`);
+        console.log(`[Cron] Periodic check finished. Attempted: ${checksAttempted}, Notifications: ${successfulNotifications}, Errors: ${errorsEncountered}. Time taken: ${(new Date() - scheduleTime) / 1000}s`);
 
     } catch (error) {
-        console.error('[Scheduler] Unexpected error during periodic check execution:', error);
-        // Send error response to Cloud Scheduler
-        res.status(500).send('Internal Server Error during periodic check');
+        console.error('[Cron] Unexpected error during periodic check execution:', error);
     }
+}
+
+// Set up a cron job to run every 15 minutes
+nodeCron.schedule('*/15 * * * *', () => {
+    console.log('[Cron] Starting scheduled check at', new Date().toISOString());
+    runPeriodicCheck().catch(error => {
+        console.error('[Cron] Error in scheduled check:', error);
+    });
 });
 
 // Optional: A root path for health checks or basic info
@@ -1001,9 +952,9 @@ bot.on('webhook_error', (error) => {
     console.error(`Webhook error: ${error.code} - ${error.message}`);
 });
 
-// --- Webhook Setup Function --- (Keep this, but call it manually/separately)
+// --- Webhook Setup Function ---
 const setWebhook = async () => {
-    const webhookUrl = process.env.WEBHOOK_URL; // e.g., https://your-service-name-hash-ew.a.run.app
+    const webhookUrl = process.env.WEBHOOK_URL;
     if (!webhookUrl) {
         console.error("Hata: WEBHOOK_URL ortam değişkeni ayarlanmamış. Webhook ayarlanamıyor.");
         return;
@@ -1013,7 +964,7 @@ const setWebhook = async () => {
         await bot.setWebHook(fullWebhookUrl);
         console.log(`Webhook başarıyla ayarlandı: ${fullWebhookUrl}`);
 
-        // Optional: Get webhook info to confirm
+        // Get webhook info to confirm
         const info = await bot.getWebHookInfo();
         console.log("Webhook bilgisi:", info);
 
@@ -1022,22 +973,23 @@ const setWebhook = async () => {
     }
 };
 
-// --- Call setWebhook() manually when needed ---
-// Don't call setWebhook() here automatically on startup in Cloud Run
-// setWebhook();
+// Start the server
+app.listen(PORT, () => {
+    console.log(`HTTP Server started on port ${PORT}`);
+    console.log('Telegram bot started...');
 
-console.log(`HTTP Server started on port ${PORT}`);
-console.log('Telegram bot started...');
+    // Check if we should set up the webhook automatically
+    const autoSetupWebhook = process.env.AUTO_SETUP_WEBHOOK === 'true';
+    if (autoSetupWebhook) {
+        console.log('Automatically setting up webhook...');
+        setWebhook();
+    } else {
+        console.log('Webhook setup is manual. Run "npm run setup-webhook" to set it up.');
+    }
+});
 
 // TODO: Add functions for station disambiguation (showing inline keyboard)
 // TODO: Add function to call check_tcdd.js --list-times and parse output
 // TODO: Integrate a calendar library for day selection
 // TODO: Add inline keyboard for seat type selection
-
-// Remove the invalid artifact from the previous edit
-
-// TODO: Integrate a calendar library for day selection
-// TODO: Add inline keyboard for seat type selection
-
-// Remove the invalid artifact from the previous edit
 
