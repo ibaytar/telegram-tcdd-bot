@@ -1,5 +1,6 @@
 const http = require('http');
 const express = require('express'); // Import Express
+const { OAuth2Client } = require('google-auth-library');
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
@@ -7,7 +8,6 @@ const { createClient } = require('@supabase/supabase-js');
 const { exec } = require('child_process'); // To run the check_tcdd.js script
 const path = require('path'); // Needed for script path
 const util = require('util'); // For promisify
-const cron = require('node-cron'); // For scheduling checks
 
 // --- Credentials ---
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -24,28 +24,199 @@ const bot = new TelegramBot(token);
 const app = express();
 const PORT = process.env.PORT || 8080;
 const supabase = createClient(supabaseUrl, supabaseKey);
+const authClient = new OAuth2Client();
 
 app.use(express.json());
 const WEBHOOK_PATH = `/webhook/${token}`; // Using token in path adds a layer of security
 
+// --- Cloud Scheduler Verification Middleware ---
+// Function to verify OIDC token from Cloud Scheduler
+async function verifyCloudSchedulerToken(req, res, next) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+        console.warn('[Auth] Scheduler request missing Authorization header.');
+        return res.status(401).send('Unauthorized: Missing Authorization header');
+    }
+
+    const [bearer, token] = authHeader.split(' ');
+
+    if (bearer !== 'Bearer' || !token) {
+        console.warn('[Auth] Scheduler request had malformed Authorization header.');
+        return res.status(401).send('Unauthorized: Malformed Authorization header');
+    }
+
+    try {
+        // Replace with your Cloud Run service URL or leave undefined for broader validation
+        const expectedAudience = process.env.CLOUD_RUN_SERVICE_URL; // Set this in your .env or Cloud Run env vars
+
+        if (!expectedAudience) {
+             console.warn('[Auth] CLOUD_RUN_SERVICE_URL environment variable not set. Cannot verify audience.');
+             // Decide if you want to proceed without audience check (less secure) or fail
+             // return res.status(500).send('Configuration error: Audience not set');
+        }
+
+
+        // Verify the token
+        const ticket = await authClient.verifyIdToken({
+            idToken: token,
+            audience: expectedAudience, // Verify it's intended for your service
+        });
+
+        // Optional: You could check ticket.getPayload() for issuer etc., but audience check is key
+        console.log('[Auth] Successfully verified Cloud Scheduler token.');
+        next(); // Proceed to the actual handler
+    } catch (error) {
+        console.error('[Auth] Cloud Scheduler token verification failed:', error.message);
+        return res.status(401).send(`Unauthorized: ${error.message}`);
+    }
+}
+
+// --- Telegram Webhook Endpoint ---
 app.post(WEBHOOK_PATH, (req, res) => {
     console.log("Received Telegram update via webhook:", JSON.stringify(req.body));
     bot.processUpdate(req.body); // Hand off the update to node-telegram-bot-api
     res.sendStatus(200); // Send OK status back to Telegram immediately
 });
 
+// --- Periodic Check Endpoint (Triggered by Cloud Scheduler) ---
+// Apply the verification middleware ONLY to this route
+app.post('/run-periodic-check', verifyCloudSchedulerToken, async (req, res) => {
+    console.log('[Scheduler] Received request to run periodic check...');
+    const scheduleTime = new Date(); // Log start time
+
+    try {
+        // --- Start of moved cron logic ---
+        console.log('[Cron Logic] Running periodic check for available seats...');
+
+        // 1. Fetch active monitoring requests
+        const { data: requests, error: fetchError } = await supabase
+            .from('user_requests')
+            .select('*') // Select all needed fields
+            .eq('status', 'monitoring');
+
+        if (fetchError) {
+            console.error('[Cron Logic] Error fetching monitoring requests:', fetchError);
+            // Send error response to Scheduler so it knows the job failed
+            return res.status(500).send('Error fetching monitoring requests');
+        }
+
+        if (!requests || requests.length === 0) {
+            console.log('[Cron Logic] No active monitoring requests to check.');
+            // Send success response as there's nothing to do
+            return res.status(200).send('No active monitoring requests');
+        }
+
+        console.log(`[Cron Logic] Checking ${requests.length} monitoring requests...`);
+
+        let checksAttempted = 0;
+        let successfulNotifications = 0;
+        let errorsEncountered = 0;
+
+        // 2. Loop through requests (run checks sequentially for now)
+        for (const req of requests) {
+             checksAttempted++;
+             // Basic check for essential data
+             if (!req.mapped_departure || !req.mapped_arrival || !req.selected_date || !req.seat_type || !req.selected_times || req.selected_times.length === 0) {
+                 console.warn(`[Cron Logic] Skipping request for chat ${req.chat_id} due to missing data:`, req);
+                 // Consider setting status to 'error' or 'cancelled' here after multiple failures
+                 continue;
+             }
+
+             try {
+                 console.log(`[Cron Logic] Checking request for chat ${req.chat_id} (Date: ${req.selected_date}, Times: ${req.selected_times?.join(',')}, Type: ${req.seat_type})`);
+
+                 // 3. Construct and execute check_tcdd.js command
+                 const scriptPath = path.join(__dirname, 'check_tcdd.js');
+                 const command = `node --expose-gc --optimize-for-size --max-old-space-size=512 "${scriptPath}" --nereden="${req.mapped_departure}" --nereye="${req.mapped_arrival}" --tarih="${req.selected_date}"`;
+
+                 const execPromise = util.promisify(exec);
+                 // Increased timeout for Firefox in cloud environment
+                 const { stdout, stderr } = await execPromise(command, {
+                     timeout: 120000, // 2 minutes
+                     maxBuffer: 1024 * 1024 // 1MB buffer for output
+                 });
+
+                 if (stderr && !stderr.includes('INFO:CONSOLE')) {
+                      console.warn(`[Cron Logic Stderr] for chat ${req.chat_id}: ${stderr}`);
+                 }
+
+                 // 4. Parse output
+                 const lines = stdout.split(/\r?\n/);
+                 const jsonLine = lines.find(line => line.startsWith('SEAT_DATA_JSON:'));
+                 if (!jsonLine) {
+                      console.error(`[Cron Logic Check Error] No SEAT_DATA_JSON found in output for chat ${req.chat_id}. Script output:
+${stdout}`);
+                      errorsEncountered++;
+                      continue; // Skip to next request
+                 }
+                 const jsonString = jsonLine.substring('SEAT_DATA_JSON:'.length);
+                 const currentResults = JSON.parse(jsonString);
+
+                 // 5. Check for matches
+                 let foundMatch = false;
+                 for (const timeResult of currentResults) {
+                     // Is this one of the times the user selected?
+                     if (req.selected_times?.includes(timeResult.time)) {
+                         // Does the details object contain the seat type they want?
+                         if (timeResult.details && timeResult.details[req.seat_type]) {
+                              // Is the count greater than 0?
+                              if (timeResult.details[req.seat_type] > 0) {
+                                 foundMatch = true;
+                                 const countFound = timeResult.details[req.seat_type];
+                                 console.log(`[Cron Logic] === FOUND SEAT! === Chat: ${req.chat_id}, Time: ${timeResult.time}, Type: ${req.seat_type}, Count: ${countFound}`);
+
+                                 // 6. Notify user
+                                 const message = `🎉 Koltuk Bulundu! 🎉\n\nİstek Detayları:\nKalkış: ${req.mapped_departure}\nVarış: ${req.mapped_arrival}\nTarih: ${req.selected_date}\n\nSefer Saati: *${timeResult.time}*\nKoltuk Tipi: *${req.seat_type}*\nBoş Koltuk Sayısı: *${countFound}*\n\nHemen bilet almak için: https://ebilet.tcddtasimacilik.gov.tr/`;
+                                 await bot.sendMessage(req.chat_id, message, { parse_mode: 'Markdown' });
+                                 successfulNotifications++;
+
+                                 // 7. Update request status to completed
+                                 await updateUserState(req.chat_id, { status: 'completed', last_check_results: null, selected_times: null });
+                                 console.log(`[Cron Logic] Request for chat ${req.chat_id} marked as completed.`);
+
+                                 break; // Stop checking other times for this request once found
+                              }
+                         }
+                     }
+                 } // end loop through time results
+
+                 if (!foundMatch) {
+                     console.log(`[Cron Logic] No matching seat found for chat ${req.chat_id} in this check.`);
+                     // Optional: Update a 'last_checked_at' timestamp in Supabase
+                 }
+
+             } catch (execError) {
+                  console.error(`[Cron Logic] Error executing check_tcdd.js for chat ${req.chat_id}:`, execError);
+                  errorsEncountered++;
+                  // Consider notifying the user or setting status to 'error'
+                  // Optionally: await bot.sendMessage(req.chat_id, `⚠️ Periyodik kontrol sırasında bir hata oluştu (${req.selected_date} ${req.mapped_departure} -> ${req.mapped_arrival}). Lütfen tekrar deneyin veya yönetici ile iletişime geçin.`);
+             }
+        } // End loop through requests
+        // --- End of moved cron logic ---
+
+        console.log(`[Scheduler] Periodic check finished. Attempted: ${checksAttempted}, Notifications: ${successfulNotifications}, Errors: ${errorsEncountered}. Time taken: ${(new Date() - scheduleTime) / 1000}s`);
+        // Send success response to Cloud Scheduler
+        res.status(200).send(`Check completed. Attempted: ${checksAttempted}, Notifications: ${successfulNotifications}, Errors: ${errorsEncountered}`);
+
+    } catch (error) {
+        console.error('[Scheduler] Unexpected error during periodic check execution:', error);
+        // Send error response to Cloud Scheduler
+        res.status(500).send('Internal Server Error during periodic check');
+    }
+});
+
 // Optional: A root path for health checks or basic info
 app.get('/', (req, res) => {
-    res.status(200).send('Telegram Bot is running (Webhook Mode)');
+    res.status(200).send('Telegram Bot is running (Webhook + Scheduler Endpoint)');
 });
 
 // --- Start the Express Server ---
 app.listen(PORT, () => {
     console.log(`HTTP Server started on port ${PORT}`);
     console.log(`Webhook endpoint ready at ${WEBHOOK_PATH}`);
-    // You only need to set the webhook ONCE, usually manually or via a setup script
-    // Do NOT set it here on every startup if running on Cloud Run, as the URL might change
-    // setWebhook(); // See function below - use this carefully
+    console.log(`Scheduler endpoint ready at /run-periodic-check`);
+    // setWebhook(); // Make sure webhook is set manually or via a separate script
 });
 
 
@@ -422,7 +593,7 @@ bot.on('callback_query', async (callbackQuery) => {
              // Answer the callback to dismiss the loading state on the button, and show an alert
              await bot.answerCallbackQuery(callbackQuery.id, { text: "❌ Yetkiniz yok.", show_alert: true });
         } catch(e){
-             console.warn(`[Auth] Failed to answer callback for denied user ${chatId}:`, e.message); 
+             console.warn(`[Auth] Failed to answer callback for denied user ${chatId}:`, e.message);
         }
         return;
     }
@@ -442,12 +613,12 @@ bot.on('callback_query', async (callbackQuery) => {
 
     // --- Callback Handling Logic ---
     try { // Wrap handler in try/catch for safety
-        // --- Add/Ensure Station Selection Handlers --- 
+        // --- Add/Ensure Station Selection Handlers ---
         if (currentState.status === 'awaiting_departure_choice' && data.startsWith('station_select_dep:')) {
             const selectedStationKey = data.substring('station_select_dep:'.length);
             console.log(`Departure station selected via callback: ${selectedStationKey}`);
-            bot.editMessageText(`Kalkış istasyonu '${selectedStationKey}' olarak seçildi.\nŞimdi varış istasyonunu yazın:`, { 
-                chat_id: chatId, 
+            bot.editMessageText(`Kalkış istasyonu '${selectedStationKey}' olarak seçildi.\nŞimdi varış istasyonunu yazın:`, {
+                chat_id: chatId,
                 message_id: msg.message_id,
                 reply_markup: { inline_keyboard: [] } // Remove keyboard
             });
@@ -469,9 +640,9 @@ bot.on('callback_query', async (callbackQuery) => {
                 mapped_arrival: selectedStationKey,
                 status: 'awaiting_day'
             });
-        // --- End Station Selection Handlers --- 
-          
-        // --- Multi-Time Toggle Handler --- 
+        // --- End Station Selection Handlers ---
+
+        // --- Multi-Time Toggle Handler ---
         } else if (currentState.status === 'awaiting_multi_time_selection' && data.startsWith('multi_time_toggle:')) {
             const timeToToggle = data.substring('multi_time_toggle:'.length);
             console.log(`Toggling time selection: ${timeToToggle}`);
@@ -504,7 +675,7 @@ bot.on('callback_query', async (callbackQuery) => {
                      const buttonText = isSelected ? `✅ ${result.time}` : result.time;
                      return { text: buttonText, callback_data: `multi_time_toggle:${result.time}` };
                  });
-                 
+
                  const timeKeyboardRows = [];
                  for (let i = 0; i < timeButtons.length; i += 3) {
                      timeKeyboardRows.push(timeButtons.slice(i, i + 3)); // Create rows of 3 buttons
@@ -526,7 +697,7 @@ bot.on('callback_query', async (callbackQuery) => {
                  // Maybe notify user?
             }
 
-        // --- Multi-Time Done Handler --- 
+        // --- Multi-Time Done Handler ---
         } else if (currentState.status === 'awaiting_multi_time_selection' && data === 'multi_time_done') {
             console.log('Multi-time selection done.');
 
@@ -583,7 +754,7 @@ bot.on('callback_query', async (callbackQuery) => {
                  await updateUserState(chatId, { status: 'completed', last_check_results: null, selected_times: null });
             }
 
-        // --- Seat Type Selection Handler --- 
+        // --- Seat Type Selection Handler ---
         } else if (currentState.status === 'awaiting_seat_type_selection' && data.startsWith('seat_select:')) {
             // --- Modify seat_select handler to use selected_times ---
             const selectedSeatType = data.substring('seat_select:'.length);
@@ -598,7 +769,7 @@ bot.on('callback_query', async (callbackQuery) => {
                     message_id: msg.message_id,
                     reply_markup: { inline_keyboard: [] }
                  }).catch(err => console.error("Failed to edit message on seat_select error:", err));
-                 return; 
+                 return;
             }
 
             // Send final confirmation message
@@ -610,11 +781,11 @@ bot.on('callback_query', async (callbackQuery) => {
 
             // Update state to monitoring, keeping selected_times
             await updateUserState(chatId, {
-                seat_type: selectedSeatType, 
-                status: 'monitoring', 
+                seat_type: selectedSeatType,
+                status: 'monitoring',
                 last_check_results: null // Clear check results, but keep selected_times
             });
-        // --- Calendar Navigation Handler --- 
+        // --- Calendar Navigation Handler ---
         } else if (data.startsWith('calendar_nav:')) {
             // Handle calendar navigation
             if (currentState.status !== 'awaiting_day') return; // Ignore if not in correct state
@@ -622,7 +793,7 @@ bot.on('callback_query', async (callbackQuery) => {
             const newCalendar = generateCalendarKeyboard(year, month);
             bot.editMessageReplyMarkup(newCalendar, { chat_id: chatId, message_id: msg.message_id });
 
-        // --- Calendar Day Handler --- 
+        // --- Calendar Day Handler ---
         } else if (data.startsWith('calendar_day:')) {
             // Handle day selection
             if (currentState.status !== 'awaiting_day') return; // Ignore if not in correct state
@@ -652,10 +823,13 @@ Seferler ve koltuk sayıları kontrol ediliyor... Bu işlem biraz sürebilir, l�
 
             // Execute the script
             const scriptPath = path.join(__dirname, 'check_tcdd.js');
-            const command = `node "${scriptPath}" --nereden="${requestData.mapped_departure}" --nereye="${requestData.mapped_arrival}" --tarih="${requestData.selected_date}"`;
+            const command = `node --expose-gc --optimize-for-size --max-old-space-size=512 "${scriptPath}" --nereden="${requestData.mapped_departure}" --nereye="${requestData.mapped_arrival}" --tarih="${requestData.selected_date}"`;
             console.log(`[Exec] Running command: ${command}`);
 
-            exec(command, { timeout: 90000 }, async (error, stdout, stderr) => { // Increased timeout
+            exec(command, {
+                timeout: 120000, // 2 minutes
+                maxBuffer: 1024 * 1024 // 1MB buffer for output
+            }, async (error, stdout, stderr) => { // Increased timeout for Firefox
                 let updatePayload = {}; // To store final status update
                 try {
                     if (error) {
@@ -704,7 +878,7 @@ Seferler ve koltuk sayıları kontrol ediliyor... Bu işlem biraz sürebilir, l�
                             // Button shows time, callback toggles selection
                             return { text: `${result.time}`, callback_data: `multi_time_toggle:${result.time}` };
                         });
-                        
+
                         const timeKeyboardRows = [];
                         for (let i = 0; i < timeButtons.length; i += 3) {
                             timeKeyboardRows.push(timeButtons.slice(i, i + 3)); // Create rows of 3 buttons
@@ -719,9 +893,9 @@ Seferler ve koltuk sayıları kontrol ediliyor... Bu işlem biraz sürebilir, l�
                         });
                         // Store full results, initialize empty selected_times array
                         // IMPORTANT: Add selected_times (JSON/JSONB) column to user_requests table
-                        updatePayload = { 
-                            status: 'awaiting_multi_time_selection', 
-                            last_check_results: parsedResults, 
+                        updatePayload = {
+                            status: 'awaiting_multi_time_selection',
+                            last_check_results: parsedResults,
                             selected_times: [] // Initialize as empty array
                         };
 
@@ -730,12 +904,12 @@ Seferler ve koltuk sayıları kontrol ediliyor... Bu işlem biraz sürebilir, l�
                         console.log(`[No Time Slots Found] for chat ${chatId}`);
                         let resultMessage = `Tarih: ${selectedDate}\nKalkış: ${requestData.mapped_departure}\nVarış: ${requestData.mapped_arrival}\n\n`;
                         resultMessage += "Belirtilen tarih için sefer bulunamadı.";
-                        await bot.editMessageText(resultMessage, { 
+                        await bot.editMessageText(resultMessage, {
                              chat_id: chatId,
                              message_id: msg.message_id,
                              reply_markup: { inline_keyboard: [] }
                         });
-                        updatePayload = { status: 'completed', last_check_results: null }; 
+                        updatePayload = { status: 'completed', last_check_results: null };
                     }
                 } finally {
                      // Ensure state is always updated, even if errors occurred before this point
@@ -758,7 +932,7 @@ Seferler ve koltuk sayıları kontrol ediliyor... Bu işlem biraz sürebilir, l�
     }
 });
 
-// --- Function to handle station input --- 
+// --- Function to handle station input ---
 async function handleStationInput(chatId, text, currentState, inputType) {
     const normalizedText = text.trim();
     const matches = findMatchingStations(normalizedText);
@@ -827,115 +1001,30 @@ bot.on('webhook_error', (error) => {
     console.error(`Webhook error: ${error.code} - ${error.message}`);
 });
 
-// --- Periodic Check Scheduler (node-cron) ---
-console.log('Scheduling periodic seat check (every 5 minutes)...')
-cron.schedule('*/5 * * * *', async () => {
-    console.log('[Cron] Running periodic check for available seats...');
-    const scheduleTime = new Date(); // Log start time
-
-    // 1. Fetch active monitoring requests
-    const { data: requests, error: fetchError } = await supabase
-        .from('user_requests')
-        .select('*') // Select all needed fields
-        .eq('status', 'monitoring');
-
-    if (fetchError) {
-        console.error('[Cron] Error fetching monitoring requests:', fetchError);
-        return;
-    }
-
-    if (!requests || requests.length === 0) {
-        console.log('[Cron] No active monitoring requests to check.');
-        return;
-    }
-
-    console.log(`[Cron] Checking ${requests.length} monitoring requests...`);
-
-    // 2. Loop through requests (run checks sequentially for now to avoid overwhelming the site/script)
-    for (const req of requests) {
-        // Basic check for essential data
-        if (!req.mapped_departure || !req.mapped_arrival || !req.selected_date || !req.seat_type || !req.selected_times || req.selected_times.length === 0) {
-             console.warn(`[Cron] Skipping request for chat ${req.chat_id} due to missing data:`, req);
-             // Consider setting status to 'error' or 'cancelled' here after multiple failures
-             continue;
-        }
-        
-        try {
-            console.log(`[Cron] Checking request for chat ${req.chat_id} (Date: ${req.selected_date}, Times: ${req.selected_times?.join(',')}, Type: ${req.seat_type})`);
-
-            // 3. Construct and execute check_tcdd.js command
-            const scriptPath = path.join(__dirname, 'check_tcdd.js');
-            const command = `node "${scriptPath}" --nereden="${req.mapped_departure}" --nereye="${req.mapped_arrival}" --tarih="${req.selected_date}"`;
-            
-            const execPromise = util.promisify(exec);
-            const { stdout, stderr } = await execPromise(command, { timeout: 90000 }); // Use longer timeout for cron
-
-            if (stderr && !stderr.includes('INFO:CONSOLE')) { 
-                 console.warn(`[Cron Check Stderr] for chat ${req.chat_id}: ${stderr}`);
-            }
-            
-            // 4. Parse output
-            const lines = stdout.split(/\r?\n/);
-            const jsonLine = lines.find(line => line.startsWith('SEAT_DATA_JSON:'));
-            if (!jsonLine) {
-                 console.error(`[Cron Check Error] No SEAT_DATA_JSON found in output for chat ${req.chat_id}`);
-                 continue; // Skip to next request
-            }
-            const jsonString = jsonLine.substring('SEAT_DATA_JSON:'.length);
-            const currentResults = JSON.parse(jsonString);
-
-            // 5. Check for matches
-            let foundMatch = false;
-            for (const timeResult of currentResults) {
-                // Is this one of the times the user selected?
-                if (req.selected_times?.includes(timeResult.time)) {
-                    // Does the details object contain the seat type they want?
-                    if (timeResult.details && timeResult.details[req.seat_type]) {
-                         // Is the count greater than 0?
-                         if (timeResult.details[req.seat_type] > 0) {
-                            foundMatch = true;
-                            const countFound = timeResult.details[req.seat_type];
-                            console.log(`[Cron] === FOUND SEAT! === Chat: ${req.chat_id}, Time: ${timeResult.time}, Type: ${req.seat_type}, Count: ${countFound}`);
-                            
-                            // 6. Notify User
-                            try {
-                                await bot.sendMessage(req.chat_id, `🎉 Müjde! ${req.selected_date} ${timeResult.time} seferi için aradığınız '${req.seat_type}' tipinde ${countFound} adet boş koltuk bulundu!\nHemen Bilet Al: https://ebilet.tcddtasimacilik.gov.tr/`);
-                                // 7. Update Status to completed after successful notification
-                                await updateUserState(req.chat_id, { status: 'completed' }); 
-                            } catch (notifyError) {
-                                 console.error(`[Cron] FAILED TO NOTIFY chat ${req.chat_id}:`, notifyError);
-                                 // Consider setting status to 'notification_failed' to retry later?
-                            }
-                            
-                            break; // Stop checking other times for this user once found
-                         }
-                    }
-                }
-            }
-            if (!foundMatch) {
-                 console.log(`[Cron] No matching seats found this cycle for chat ${req.chat_id}`);
-            }
-
-        } catch (checkError) {
-             // Handle potential errors like JSON parsing errors within the loop, timeout errors from exec etc.
-             console.error(`[Cron] Error during check for chat ${req.chat_id}:`, checkError);
-             // Optional: Implement retry logic or disable the request after repeated failures
-        }
-        // Optional: Add a small delay between checks if hitting rate limits
-        // await new Promise(resolve => setTimeout(resolve, 500)); 
-    }
-    console.log(`[Cron] Finished periodic check. Duration: ${(new Date() - scheduleTime)/1000}s`);
-});
+// --- Webhook Setup Function --- (Keep this, but call it manually/separately)
 const setWebhook = async () => {
-    const webhookUrl = `YOUR_CLOUDRUN_SERVICE_URL${WEBHOOK_PATH}`; // Get this from gcloud or Console
-    console.log(`Setting webhook to: ${webhookUrl}`);
+    const webhookUrl = process.env.WEBHOOK_URL; // e.g., https://your-service-name-hash-ew.a.run.app
+    if (!webhookUrl) {
+        console.error("Hata: WEBHOOK_URL ortam değişkeni ayarlanmamış. Webhook ayarlanamıyor.");
+        return;
+    }
+    const fullWebhookUrl = `${webhookUrl}${WEBHOOK_PATH}`;
     try {
-        await bot.setWebHook(webhookUrl);
-        console.log('Webhook set successfully!');
+        await bot.setWebHook(fullWebhookUrl);
+        console.log(`Webhook başarıyla ayarlandı: ${fullWebhookUrl}`);
+
+        // Optional: Get webhook info to confirm
+        const info = await bot.getWebHookInfo();
+        console.log("Webhook bilgisi:", info);
+
     } catch (error) {
-        console.error('Error setting webhook:', error.response ? error.response.body : error.message);
+        console.error("Webhook ayarlama hatası:", error.message);
     }
 };
+
+// --- Call setWebhook() manually when needed ---
+// Don't call setWebhook() here automatically on startup in Cloud Run
+// setWebhook();
 
 console.log(`HTTP Server started on port ${PORT}`);
 console.log('Telegram bot started...');

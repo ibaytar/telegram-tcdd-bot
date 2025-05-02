@@ -9,7 +9,7 @@ RUN npm install -g pnpm
 # Set the working directory in the container
 WORKDIR /app
 
-# --- Install OS Dependencies for Playwright --- 
+# --- Install OS Dependencies for Playwright ---
 # Based on official Playwright Docker guide
 # https://playwright.dev/docs/docker
 RUN apt-get update && \
@@ -51,7 +51,7 @@ RUN apt-get update && \
     xvfb \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
-# --- End OS Dependencies --- 
+# --- End OS Dependencies ---
 
 # Copy dependency definition files FROM THE PROJECT ROOT
 # Assumes build context is the parent directory of bot_deploy
@@ -66,9 +66,14 @@ COPY bot.js ./
 COPY check_tcdd.js ./
 COPY stations.json ./
 
-# Install Playwright browsers
+# Install Playwright with Firefox (lightweight configuration)
 # Use pnpm exec to ensure the correct playwright instance is used
-RUN pnpm exec playwright install --with-deps chromium
+RUN pnpm exec playwright install --with-deps firefox
 
-# Set the command to run the bot (now directly in /app)
-CMD ["node", "bot.js"] 
+# Set environment variables for memory optimization
+ENV NODE_OPTIONS="--max-old-space-size=512"
+ENV PLAYWRIGHT_BROWSERS_PATH=0
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
+
+# Set the command to run the bot with memory optimization flags
+CMD ["node", "--expose-gc", "--optimize-for-size", "--max-old-space-size=512", "bot.js"]
