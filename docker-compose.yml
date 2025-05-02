@@ -1,0 +1,44 @@
+version: '3'
+
+services:
+  tcdd-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      # These will be loaded from .env file or set directly in the environment
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      # Browser configuration
+      - PLAYWRIGHT_BROWSERS_PATH=0
+      - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+      - PLAYWRIGHT_BROWSER_NAME=firefox
+      - PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH=/usr/bin/firefox-esr
+      - PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+      # Firefox sandbox disabling
+      - MOZ_DISABLE_CONTENT_SANDBOX=1
+      - MOZ_DISABLE_GMP_SANDBOX=1
+      - MOZ_DISABLE_NPAPI_SANDBOX=1
+      - MOZ_DISABLE_PREF_SANDBOX=1
+      - MOZ_DISABLE_RDD_SANDBOX=1
+      - MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+      - MOZ_DISABLE_UTILITY_SANDBOX=1
+      - MOZ_SANDBOX_LOGGING=1
+      # Display server
+      - DISPLAY=:99
+      - XVFB_DISPLAY=:99
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
