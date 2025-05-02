@@ -3,7 +3,8 @@
 // Force timezone for the Node.js process
 process.env.TZ = 'Europe/Istanbul';
 
-const { firefox } = require('playwright'); // Using Firefox instead of Chromium
+// Import both Firefox and Chromium as fallback
+const playwright = require('playwright');
 const { Command } = require('commander');
 const program = new Command();
 
@@ -13,6 +14,30 @@ const DEFAULT_TIMEOUT = 45000; // 45 seconds
 
 // Memory optimization flags
 process.env.PLAYWRIGHT_BROWSERS_PATH = '0'; // Use browsers from system path when available
+
+// Function to get the appropriate browser type
+async function getBrowserType() {
+  // First try Firefox
+  try {
+    console.log('Trying to use Firefox...');
+    return playwright.firefox;
+  } catch (e) {
+    console.error('Firefox not available, falling back to Chromium:', e.message);
+    try {
+      // Fall back to Chromium
+      return playwright.chromium;
+    } catch (e2) {
+      console.error('Chromium not available either:', e2.message);
+      // Fall back to Webkit as last resort
+      try {
+        console.error('Trying WebKit as last resort...');
+        return playwright.webkit;
+      } catch (e3) {
+        throw new Error('No browser engines available: ' + e3.message);
+      }
+    }
+  }
+}
 
 // --- Station Mapping (Loaded from JSON in the same directory) ---
 const stationMap = require('./stations.json'); // Load from ./stations.json
@@ -63,79 +88,81 @@ async function run(departureSelect, arrivalSelect, targetDateStr) {
   console.log(` (Arama için kullanılacak: Kalkış='${departureSearch}', Varış='${arrivalSearch}')`);
   // ---
 
-  // Ultra-lightweight Firefox configuration for cloud environments
-  console.log('Firefox tarayıcısı başlatılıyor (hafif mod)...');
-  const browser = await firefox.launch({
+  // Get the appropriate browser type (Firefox with fallbacks)
+  console.log('Tarayıcı başlatılıyor...');
+
+  // Get browser type (Firefox, Chromium, or WebKit)
+  const browserType = await getBrowserType();
+  console.log(`Using browser engine: ${browserType.name()}`);
+
+  // Check if we have a system Firefox path set (only for Firefox)
+  let executablePath = undefined;
+  if (browserType.name() === 'firefox' && process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH) {
+    executablePath = process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH;
+    console.log(`Using system Firefox at: ${executablePath}`);
+  } else {
+    console.log('Using bundled browser (if available)');
+  }
+
+  // Prepare browser launch options based on browser type
+  const launchOptions = {
     headless: true,
-    firefoxUserPrefs: {
+    executablePath
+  };
+
+  // Add browser-specific options
+  if (browserType.name() === 'firefox') {
+    // Firefox-specific options
+    launchOptions.firefoxUserPrefs = {
       // Disable unnecessary features to reduce memory usage
       'browser.cache.disk.enable': false,
       'browser.cache.memory.enable': true,
       'browser.cache.memory.capacity': 4096, // Smaller memory cache (in KB)
       'browser.sessionhistory.max_entries': 1, // Minimal history
-      'browser.sessionhistory.max_total_viewers': 0,
       'browser.sessionstore.resume_from_crash': false,
       'browser.shell.checkDefaultBrowser': false,
       'browser.startup.homepage': 'about:blank',
-      'browser.tabs.remote.autostart': false, // Disable multi-process
-      'dom.ipc.processCount': 1, // Minimum process count
       'network.prefetch-next': false, // Disable prefetching
-      'network.http.speculative-parallel-limit': 0, // Disable speculative connections
       'browser.newtabpage.enabled': false,
-      'browser.newtabpage.enhanced': false,
-      'browser.newtabpage.directory.ping': '',
-      'browser.newtabpage.directory.source': 'about:blank',
-      'browser.places.smartBookmarksVersion': -1,
-      'browser.startup.page': 0,
       'extensions.enabledScopes': 0, // Disable extensions
-      'extensions.autoDisableScopes': 15,
-      'extensions.update.enabled': false,
-      'media.gmp-provider.enabled': false, // Disable media plugins
-      'media.gmp-manager.updateEnabled': false,
-      'media.gmp-gmpopenh264.enabled': false,
       'media.autoplay.enabled': false, // Disable autoplay
-      'media.autoplay.default': 5, // Block autoplay
-      'media.autoplay.blocking_policy': 2, // Strict blocking
-      'media.navigator.enabled': false, // Disable media APIs
-      'media.peerconnection.enabled': false, // Disable WebRTC
-      'media.webspeech.synth.enabled': false, // Disable speech synthesis
       'dom.webnotifications.enabled': false, // Disable notifications
       'dom.push.enabled': false, // Disable push notifications
       'dom.serviceWorkers.enabled': false, // Disable service workers
-      'dom.webgpu.enabled': false, // Disable WebGPU
-      'gfx.webrender.all': false, // Disable WebRender
-      'javascript.options.baselinejit': false, // Disable JIT for lower memory usage
-      'javascript.options.ion': false,
-      'javascript.options.native_regexp': false,
-      'javascript.options.asmjs': false,
-      'javascript.options.wasm': false,
-      'javascript.options.wasm_baselinejit': false,
       'privacy.trackingprotection.enabled': false, // Disable tracking protection
       'network.cookie.cookieBehavior': 0, // Accept all cookies
-      'security.ssl.require_safe_negotiation': false, // Less strict SSL
-      'security.tls.version.min': 1, // Minimum TLS version
-      'security.mixed_content.block_active_content': false, // Allow mixed content
-      'security.mixed_content.block_display_content': false,
-      'security.OCSP.enabled': 0, // Disable OCSP
-      'security.cert_pinning.enforcement_level': 0, // Disable cert pinning
-      'webgl.disabled': true, // Disable WebGL
-      'webgl.min_capability_mode': true,
-      'webgl.disable-extensions': true,
-      'layers.acceleration.disabled': true, // Disable hardware acceleration
-      'gfx.direct2d.disabled': true,
-      'gfx.direct3d.disabled': true,
-      'browser.display.use_document_fonts': 0, // Disable custom fonts
-      'font.blacklist.underline_offset': '', // Clear font blacklists
-      'layout.css.font-loading-api.enabled': false // Disable font loading API
-    },
-    args: [
+      'webgl.disabled': true // Disable WebGL
+    };
+
+    launchOptions.args = [
       '-headless',
       '-no-remote',
       '-foreground',
       '-width=800', // Smaller viewport
       '-height=600'
-    ]
-  });
+    ];
+  } else if (browserType.name() === 'chromium') {
+    // Chromium-specific options
+    launchOptions.args = [
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-software-rasterizer',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--window-size=800,600'
+    ];
+  } else {
+    // WebKit or other browser - minimal options
+    launchOptions.args = [
+      '--window-size=800,600'
+    ];
+  }
+
+  console.log(`Launching browser with options for ${browserType.name()}`);
+  const browser = await browserType.launch(launchOptions);
 
   // Configure context with minimal settings
   console.log('Tarayıcı bağlamı oluşturuluyor (hafif mod)...');

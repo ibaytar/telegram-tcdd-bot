@@ -1,0 +1,42 @@
+app = "telegram-tcdd-bot"
+primary_region = "fra"  # Frankfurt, Germany - close to Turkey for lower latency
+kill_signal = "SIGINT"
+kill_timeout = 5
+processes = []
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+  NODE_OPTIONS = "--max-old-space-size=512"
+  PLAYWRIGHT_BROWSERS_PATH = "0"
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "0"
+  PLAYWRIGHT_BROWSER_NAME = "firefox"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[http_service.checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/"
+    protocol = "http"
+    tls_skip_verify = false
+
+[metrics]
+  port = 8080
+  path = "/"
