@@ -15,29 +15,7 @@ const DEFAULT_TIMEOUT = 45000; // 45 seconds
 // Memory optimization flags
 process.env.PLAYWRIGHT_BROWSERS_PATH = '0'; // Use browsers from system path when available
 
-// Function to get the appropriate browser type
-async function getBrowserType() {
-  // First try Firefox
-  try {
-    console.log('Trying to use Firefox...');
-    return playwright.firefox;
-  } catch (e) {
-    console.error('Firefox not available, falling back to Chromium:', e.message);
-    try {
-      // Fall back to Chromium
-      return playwright.chromium;
-    } catch (e2) {
-      console.error('Chromium not available either:', e2.message);
-      // Fall back to Webkit as last resort
-      try {
-        console.error('Trying WebKit as last resort...');
-        return playwright.webkit;
-      } catch (e3) {
-        throw new Error('No browser engines available: ' + e3.message);
-      }
-    }
-  }
-}
+// Browser selection is now handled directly in the run function
 
 // --- Station Mapping (Loaded from JSON in the same directory) ---
 const stationMap = require('./stations.json'); // Load from ./stations.json
@@ -88,81 +66,126 @@ async function run(departureSelect, arrivalSelect, targetDateStr) {
   console.log(` (Arama için kullanılacak: Kalkış='${departureSearch}', Varış='${arrivalSearch}')`);
   // ---
 
-  // Get the appropriate browser type (Firefox with fallbacks)
-  console.log('Tarayıcı başlatılıyor...');
+  // Direct browser launch with fallback mechanism
+  console.log('Tarayıcı başlatılıyor (doğrudan mod)...');
 
-  // Get browser type (Firefox, Chromium, or WebKit)
-  const browserType = await getBrowserType();
-  console.log(`Using browser engine: ${browserType.name()}`);
+  let browser;
+  let browserType;
 
-  // Check if we have a system Firefox path set (only for Firefox)
-  let executablePath = undefined;
-  if (browserType.name() === 'firefox' && process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH) {
-    executablePath = process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH;
-    console.log(`Using system Firefox at: ${executablePath}`);
-  } else {
-    console.log('Using bundled browser (if available)');
-  }
+  // Try Firefox first
+  try {
+    console.log('Firefox deneniyor...');
+    browserType = playwright.firefox;
 
-  // Prepare browser launch options based on browser type
-  const launchOptions = {
-    headless: true,
-    executablePath
-  };
+    // Check if we have a system Firefox path
+    let executablePath = undefined;
+    if (process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH) {
+      executablePath = process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH;
+      console.log(`Sistem Firefox kullanılıyor: ${executablePath}`);
+    } else {
+      console.log('Yerleşik Firefox kullanılıyor (varsa)');
+    }
 
-  // Add browser-specific options
-  if (browserType.name() === 'firefox') {
-    // Firefox-specific options
-    launchOptions.firefoxUserPrefs = {
-      // Disable unnecessary features to reduce memory usage
-      'browser.cache.disk.enable': false,
-      'browser.cache.memory.enable': true,
-      'browser.cache.memory.capacity': 4096, // Smaller memory cache (in KB)
-      'browser.sessionhistory.max_entries': 1, // Minimal history
-      'browser.sessionstore.resume_from_crash': false,
-      'browser.shell.checkDefaultBrowser': false,
-      'browser.startup.homepage': 'about:blank',
-      'network.prefetch-next': false, // Disable prefetching
-      'browser.newtabpage.enabled': false,
-      'extensions.enabledScopes': 0, // Disable extensions
-      'media.autoplay.enabled': false, // Disable autoplay
-      'dom.webnotifications.enabled': false, // Disable notifications
-      'dom.push.enabled': false, // Disable push notifications
-      'dom.serviceWorkers.enabled': false, // Disable service workers
-      'privacy.trackingprotection.enabled': false, // Disable tracking protection
-      'network.cookie.cookieBehavior': 0, // Accept all cookies
-      'webgl.disabled': true // Disable WebGL
+    // Firefox launch options with sandbox disabled
+    const firefoxOptions = {
+      headless: true,
+      executablePath,
+      firefoxUserPrefs: {
+        'browser.cache.disk.enable': false,
+        'browser.cache.memory.enable': true,
+        'browser.sessionhistory.max_entries': 1,
+        'browser.sessionstore.resume_from_crash': false,
+        'browser.shell.checkDefaultBrowser': false,
+        'browser.startup.homepage': 'about:blank',
+        'network.prefetch-next': false,
+        'browser.newtabpage.enabled': false,
+        'extensions.enabledScopes': 0,
+        'media.autoplay.enabled': false,
+        'dom.webnotifications.enabled': false,
+        'dom.push.enabled': false,
+        'dom.serviceWorkers.enabled': false,
+        'security.sandbox.content.level': 0,
+        'browser.tabs.remote.autostart': false,
+        'browser.tabs.remote.autostart.2': false,
+        'security.sandbox.logging.enabled': true
+      },
+      args: [
+        '-headless',
+        '-no-remote',
+        '-foreground',
+        '-width=800',
+        '-height=600',
+        '-no-sandbox',
+        '-safe-mode'
+      ],
+      env: {
+        ...process.env,
+        MOZ_DISABLE_CONTENT_SANDBOX: '1',
+        MOZ_DISABLE_GMP_SANDBOX: '1',
+        MOZ_DISABLE_NPAPI_SANDBOX: '1',
+        MOZ_DISABLE_PREF_SANDBOX: '1',
+        MOZ_DISABLE_RDD_SANDBOX: '1',
+        MOZ_DISABLE_SOCKET_PROCESS_SANDBOX: '1',
+        MOZ_DISABLE_UTILITY_SANDBOX: '1',
+        MOZ_SANDBOX_LOGGING: '1'
+      }
     };
 
-    launchOptions.args = [
-      '-headless',
-      '-no-remote',
-      '-foreground',
-      '-width=800', // Smaller viewport
-      '-height=600'
-    ];
-  } else if (browserType.name() === 'chromium') {
-    // Chromium-specific options
-    launchOptions.args = [
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--disable-software-rasterizer',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--window-size=800,600'
-    ];
-  } else {
-    // WebKit or other browser - minimal options
-    launchOptions.args = [
-      '--window-size=800,600'
-    ];
+    console.log('Firefox başlatılıyor...');
+    browser = await browserType.launch(firefoxOptions);
+    console.log('Firefox başarıyla başlatıldı!');
+  } catch (firefoxError) {
+    // Firefox failed, try Chromium
+    console.error('Firefox başlatılamadı:', firefoxError.message);
+    console.log('Chromium deneniyor...');
+
+    try {
+      browserType = playwright.chromium;
+
+      // Check if we have a system Chromium path
+      let executablePath = undefined;
+      if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+        executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+        console.log(`Sistem Chromium kullanılıyor: ${executablePath}`);
+      } else {
+        console.log('Yerleşik Chromium kullanılıyor (varsa)');
+      }
+
+      // Chromium launch options with sandbox disabled
+      const chromiumOptions = {
+        headless: true,
+        executablePath,
+        args: [
+          '--disable-dev-shm-usage',
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-gpu',
+          '--disable-extensions',
+          '--disable-software-rasterizer',
+          '--disable-web-security',
+          '--disable-features=IsolateOrigins,site-per-process',
+          '--window-size=800,600',
+          '--disable-infobars',
+          '--disable-notifications',
+          '--mute-audio'
+        ],
+        env: {
+          ...process.env,
+          CHROMIUM_FLAGS: '--disable-gpu --no-sandbox --disable-setuid-sandbox'
+        }
+      };
+
+      console.log('Chromium başlatılıyor...');
+      browser = await browserType.launch(chromiumOptions);
+      console.log('Chromium başarıyla başlatıldı!');
+    } catch (chromiumError) {
+      // Both Firefox and Chromium failed
+      console.error('Chromium da başlatılamadı:', chromiumError.message);
+      throw new Error(`Hiçbir tarayıcı başlatılamadı. Firefox hatası: ${firefoxError.message}, Chromium hatası: ${chromiumError.message}`);
+    }
   }
 
-  console.log(`Launching browser with options for ${browserType.name()}`);
-  const browser = await browserType.launch(launchOptions);
+  console.log(`Tarayıcı başlatıldı: ${browserType.name()}`);
 
   // Configure context with minimal settings
   console.log('Tarayıcı bağlamı oluşturuluyor (hafif mod)...');

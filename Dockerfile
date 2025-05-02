@@ -69,6 +69,12 @@ RUN apt-get update && \
 # Set path to system browsers
 ENV PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH=/usr/bin/firefox-esr
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
+# Fix permissions for Firefox
+RUN mkdir -p /root/.mozilla && \
+    chmod -R 777 /root/.mozilla && \
+    mkdir -p /tmp/.X11-unix && \
+    chmod 1777 /tmp/.X11-unix
 # --- End OS Dependencies ---
 
 # Copy dependency definition files FROM THE PROJECT ROOT
@@ -95,11 +101,51 @@ ENV PLAYWRIGHT_BROWSER_NAME=firefox
 ENV DISPLAY=:99
 ENV XVFB_DISPLAY=:99
 
-# Set up Xvfb for headless browser support
-RUN apt-get update && apt-get install -y xvfb && apt-get clean
+# Firefox sandbox disabling
+ENV MOZ_DISABLE_CONTENT_SANDBOX=1
+ENV MOZ_DISABLE_GMP_SANDBOX=1
+ENV MOZ_DISABLE_NPAPI_SANDBOX=1
+ENV MOZ_DISABLE_PREF_SANDBOX=1
+ENV MOZ_DISABLE_RDD_SANDBOX=1
+ENV MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+ENV MOZ_DISABLE_UTILITY_SANDBOX=1
+ENV MOZ_SANDBOX_LOGGING=1
 
-# Create a startup script that runs Xvfb before the bot
-RUN echo '#!/bin/bash\nXvfb :99 -screen 0 1280x720x24 -ac &\nexec "$@"' > /app/start.sh && \
+# Chromium sandbox disabling
+ENV CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage"
+
+# Set up Xvfb for headless browser support
+RUN apt-get update && apt-get install -y xvfb dbus-x11 libpci3 && apt-get clean
+
+# Create a more robust startup script that runs Xvfb before the bot
+RUN echo '#!/bin/bash\n\
+echo "Starting Xvfb..."\n\
+Xvfb :99 -screen 0 1280x720x24 -ac &\n\
+XVFB_PID=$!\n\
+sleep 2\n\
+echo "Xvfb started with PID: $XVFB_PID"\n\
+\n\
+# Start dbus if it exists\n\
+if [ -x "$(command -v dbus-daemon)" ]; then\n\
+  echo "Starting dbus..."\n\
+  mkdir -p /var/run/dbus\n\
+  dbus-daemon --system --fork\n\
+  sleep 1\n\
+fi\n\
+\n\
+# Execute the command\n\
+echo "Executing command: $@"\n\
+"$@"\n\
+EXIT_CODE=$?\n\
+\n\
+# Clean up\n\
+echo "Cleaning up..."\n\
+if [ -n "$XVFB_PID" ]; then\n\
+  echo "Stopping Xvfb (PID: $XVFB_PID)"\n\
+  kill $XVFB_PID || true\n\
+fi\n\
+\n\
+exit $EXIT_CODE' > /app/start.sh && \
     chmod +x /app/start.sh
 
 # Set the command to run the bot with memory optimization flags
