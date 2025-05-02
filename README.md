@@ -1,14 +1,16 @@
 # Telegram TCDD Bot
 
-A Telegram bot for checking TCDD (Turkish State Railways) train ticket availability.
+A Telegram bot for checking TCDD (Turkish State Railways) train ticket availability and notifying users when seats become available.
 
 ## Features
 
-- Monitor train ticket availability
+- Monitor train ticket availability for specific routes and dates
 - Get notified when seats become available
 - Support for different seat types (Economy, Business)
 - Calendar-based date selection
 - Station search with auto-completion
+- Automatic periodic checks (every 15 minutes)
+- Webhook support for instant message processing
 
 ## Deployment to Hetzner VPS
 
@@ -93,7 +95,7 @@ For production use, it's recommended to set up a domain name and HTTPS:
    server {
        listen 80;
        server_name your-domain.com;
-       
+
        location / {
            proxy_pass http://localhost:8080;
            proxy_set_header Host $host;
